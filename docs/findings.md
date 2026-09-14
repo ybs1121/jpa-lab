@@ -137,6 +137,86 @@ AUTO flush는 같은 트랜잭션의 JPA 조회가 보류 중인 변경을 반�
 
 flush를 이용하면 commit 전에 SQL 결과와 제약조건을 확인할 수 있다. 그러나 flush된 변경도 아직 트랜잭션 안에 있으므로 이후 rollback될 수 있으며, SQL 실행 로그만으로 최종 반영 여부를 판단해서는 안 된다.
 
+### 벌크 `UPDATE`와 1차 캐시 불일치
+
+#### 조건
+
+- 회원을 `findById()`로 조회해 영속성 컨텍스트에 보관
+- JPQL 벌크 `UPDATE`로 같은 회원의 이메일을 직접 변경
+- `clear`와 `refresh` 없이 같은 ID를 다시 `findById()`로 조회
+
+#### 관찰 결과
+
+1. 최초 `findById()`에서 `SELECT`가 실행됐다.
+2. 벌크 연산 호출 시 DB에 `UPDATE`가 직접 실행됐다.
+3. 기존 엔티티의 이메일은 `first@example.com`으로 남았다.
+4. 두 번째 `findById()`는 추가 `SELECT` 없이 기존 엔티티를 반환했다.
+5. 첫 번째와 두 번째 변수는 같은 인스턴스였지만, commit 후 DB 이메일은 `bulk@example.com`이었다.
+
+#### 트레이드오프
+
+벌크 연산은 여러 행을 한 SQL로 처리해 엔티티별 조회와 dirty checking을 피할 수 있다. 반면 영속성 컨텍스트를 우회하므로 이미 관리 중인 객체가 오래된 상태가 되며, 같은 ID를 단순 재조회하는 것만으로는 최신화되지 않는다.
+
+### 벌크 `UPDATE` 이후 자동 clear
+
+#### 조건
+
+- 직전 실험과 같은 조회 및 벌크 갱신 흐름
+- 벌크 메서드에 `@Modifying(clearAutomatically = true)` 적용
+
+#### 관찰 결과
+
+1. 최초 `SELECT`와 벌크 `UPDATE` 이후 영속성 컨텍스트가 비워졌다.
+2. 기존 Java 객체의 이메일은 `first@example.com`으로 유지됐지만 준영속 상태가 됐다.
+3. 두 번째 `findById()`는 `SELECT`를 실행해 `bulk@example.com`을 가진 새 관리 객체를 반환했다.
+4. 첫 번째와 두 번째 변수는 서로 다른 인스턴스였다.
+5. 정상 commit 후 DB 이메일은 `bulk@example.com`이었다.
+
+#### 트레이드오프
+
+`clearAutomatically`는 벌크 연산 직후 오래된 1차 캐시를 간단히 제거한다. 그러나 특정 엔티티만이 아니라 영속성 컨텍스트 전체를 비우므로 다른 관리 엔티티도 준영속 상태가 되고, 아직 flush되지 않은 변경을 함께 다룰 때는 실행 순서를 주의해야 한다.
+
+### 벌크 `UPDATE` 이후 단일 엔티티 refresh
+
+#### 조건
+
+- `clearAutomatically`가 없는 벌크 `UPDATE` 실행
+- 기존 관리 엔티티에 `EntityManager.refresh()` 호출
+- refresh 후 같은 ID를 다시 `findById()`로 조회
+
+#### 관찰 결과
+
+1. 최초 `SELECT`, 벌크 `UPDATE`, refresh의 `SELECT` 순서로 SQL이 실행됐다.
+2. refresh 전 기존 객체는 `first@example.com`을 유지했다.
+3. refresh 후 같은 객체의 이메일이 `bulk@example.com`으로 교체됐다.
+4. 두 번째 `findById()`는 추가 `SELECT` 없이 같은 인스턴스를 반환했다.
+5. 정상 commit 후 DB 이메일은 `bulk@example.com`이었다.
+
+#### 트레이드오프
+
+`refresh`는 영속성 컨텍스트 전체를 비우지 않고 필요한 관리 엔티티 하나만 최신화한다. 객체 동일성을 유지할 수 있지만 엔티티마다 재조회 SQL이 필요하며, 객체에 있던 미반영 변경은 DB 값으로 덮어써질 수 있다.
+
+### 벌크 `DELETE` 후 stale 엔티티 변경
+
+#### 조건
+
+- 회원을 조회한 뒤 JPQL 벌크 `DELETE`로 같은 DB 행 삭제
+- 자동 clear 없이 기존 관리 엔티티의 이메일 변경
+- 서비스 본문 안에서 명시적 flush를 호출하지 않음
+
+#### 관찰 결과
+
+1. 최초 `SELECT`와 벌크 `DELETE`가 실행된 뒤에도 기존 엔티티는 관리 상태로 남았다.
+2. 엔티티 필드 변경 후 서비스 본문의 마지막 로그까지 정상 실행됐다.
+3. 트랜잭션 완료 과정의 flush가 삭제된 행에 `UPDATE`를 실행했다.
+4. 영향받은 행이 0개여서 호출자가 `ObjectOptimisticLockingFailureException` 계열 예외를 받았다.
+5. 전체 트랜잭션이 rollback되어 앞서 실행된 `DELETE`도 취소됐다.
+6. 최종 DB에는 이메일이 `first@example.com`인 기존 회원 행이 남았다.
+
+#### 트레이드오프
+
+벌크 삭제는 엔티티를 하나씩 로딩하지 않아 효율적이지만 영속성 컨텍스트의 생명주기를 맞춰주지 않는다. 벌크 삭제 후 관리 엔티티를 계속 사용하면 커밋 시점에 지연된 실패가 발생할 수 있다. clear로 후속 dirty checking을 차단할 수 있지만 기존 객체는 준영속 상태가 되고 다른 관리 객체에도 영향을 줄 수 있다.
+
 각 결과는 다음 내용을 포함한다.
 
 - 문제와 사전 예상
