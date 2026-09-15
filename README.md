@@ -18,5 +18,9 @@ JPA 코드가 만드는 SQL과 데이터베이스 동작을 직접 검증하고,
 - `@Version` 낙관적 락의 충돌 감지와 실패 트랜잭션 rollback
 - 비관적 쓰기 락을 이용한 조회 시점부터의 직렬화
 - 조건부 원자적 `UPDATE`의 영향 행 수를 이용한 재고 차감 판정
+- LAZY 컬렉션 순회에서 발생하는 N+1과 DB 왕복 증가
+- 컬렉션 Fetch Join의 중복 행과 메모리 페이징
+- 부모 DB 페이징과 Batch Fetching의 조합
+- 부모 ID 페이징 후 Fetch Join하는 2단계 조회
 
 상세한 검증 결과는 [`docs/findings.md`](docs/findings.md)에 누적한다.
